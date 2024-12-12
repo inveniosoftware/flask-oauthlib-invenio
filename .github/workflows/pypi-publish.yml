@@ -1,0 +1,11 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - v*
+
+jobs:
+  Publish:
+    uses: inveniosoftware/workflows/.github/workflows/pypi-publish.yml@master
+    secrets: inherit
