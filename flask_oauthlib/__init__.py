@@ -12,7 +12,7 @@
     :license: BSD, see LICENSE for more details.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Hsiaoming Yang <me@lepture.com>"
 __homepage__ = 'https://github.com/inveniosoftware/flask-oauthlib-invenio'
 __license__ = 'BSD'
