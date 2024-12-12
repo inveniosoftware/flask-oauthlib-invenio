@@ -14,7 +14,7 @@ import datetime
 from functools import wraps
 from flask import request, url_for
 from flask import redirect, abort
-from werkzeug.utils import import_string, cached_property
+from werkzeug.utils import cached_property, import_string
 from oauthlib import oauth2
 from oauthlib.oauth2 import RequestValidator, Server
 from oauthlib.common import to_unicode, add_params_to_uri
@@ -471,7 +471,7 @@ class OAuth2Provider(object):
                 # denied by user
                 e = oauth2.AccessDeniedError(state=request.values.get('state'))
                 return self._on_exception(e, e.in_uri(redirect_uri))
-              
+
             return self.confirm_authorization_request()
         return decorated
 
@@ -501,7 +501,7 @@ class OAuth2Provider(object):
             return self._on_exception(e, e.in_uri(self.error_uri))
         except oauth2.OAuth2Error as e:
             log.debug('OAuth2Error: %r', e, exc_info=True)
-            
+
             # on auth error, we should preserve state if it's present according to RFC 6749
             state = request.values.get('state')
             if state and not e.state:
