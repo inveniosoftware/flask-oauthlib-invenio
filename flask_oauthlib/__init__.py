@@ -8,10 +8,11 @@
     OAuth servers.
 
     :copyright: (c) 2013 by Hsiaoming Yang.
+    :copyright: (c) Graz University of Technology
     :license: BSD, see LICENSE for more details.
 """
 
 __version__ = "0.9.6"
 __author__ = "Hsiaoming Yang <me@lepture.com>"
-__homepage__ = 'https://github.com/lepture/flask-oauthlib'
+__homepage__ = 'https://github.com/inveniosoftware/flask-oauthlib-invenio'
 __license__ = 'BSD'
