@@ -3,6 +3,18 @@ Changelog
 
 Here you can see the full list of changes between each Flask-OAuthlib release.
 
+Version 1.0.0
+-------------
+
+- setup: move to setup.cfg
+- fix: compatibility to oauthlib
+- global: make werkzeug>=3.0 ready
+- Fixing issue related Flask 3 and oauthlib new version
+- docs: fix simple typo, usally -> usually
+- Merge pull request #397 from Sambego/patch-1
+- Update Auth0 sponsorship link
+- Revert "Update dev requirements version"
+
 Version 0.9.6
 -------------
 
