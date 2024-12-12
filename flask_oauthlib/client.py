@@ -6,6 +6,7 @@
     Implemnts OAuth1 and OAuth2 support for Flask.
 
     :copyright: (c) 2013 - 2014 by Hsiaoming Yang.
+    :copyright: (c) 2020 Ulrich Berthold.
 """
 
 import logging
@@ -13,25 +14,18 @@ import oauthlib.oauth1
 import oauthlib.oauth2
 from copy import copy
 from functools import wraps
-from oauthlib.common import to_unicode, PY3, add_params_to_uri
+from oauthlib.common import to_unicode, add_params_to_uri
 from flask import request, redirect, json, session, current_app
-from werkzeug.urls import url_quote, url_decode, url_encode
 from werkzeug.http import parse_options_header
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urljoin
 from werkzeug.utils import cached_property
 from .utils import to_bytes
 try:
-    from urlparse import urljoin
     import urllib2 as http
 except ImportError:
     from urllib import request as http
-    from urllib.parse import urljoin
+
 log = logging.getLogger('flask_oauthlib')
-
-
-if PY3:
-    string_types = (str,)
-else:
-    string_types = (str, unicode)
 
 
 __all__ = ('OAuth', 'OAuthRemoteApp', 'OAuthResponse', 'OAuthException')
@@ -133,9 +127,12 @@ def parse_response(resp, content, strict=False, content_type=None):
 
     if ct != 'application/x-www-form-urlencoded' and strict:
         return content
-    charset = options.get('charset', 'utf-8')
-    return url_decode(content, charset=charset).to_dict()
 
+    charset = options.get('charset', 'utf-8')
+    parsed = urlparse(content)
+    return parse_qsl(
+        parsed.query, encoding=charset, strict_parsing=strict, keep_blank_values=True
+    )
 
 def prepare_request(uri, headers=None, data=None, method=None):
     """Make request parameters right."""
@@ -160,7 +157,7 @@ def encode_request_data(data, format):
     if format == 'json':
         return json.dumps(data or {}), 'application/json'
     if format == 'urlencoded':
-        return url_encode(data or {}), 'application/x-www-form-urlencoded'
+        return urlencode(data or {}, encoding='application/x-www-form-urlencoded')
     raise TypeError('Unknown format %r' % format)
 
 
@@ -186,11 +183,6 @@ class OAuthException(RuntimeError):
         self.data = data
 
     def __str__(self):
-        if PY3:
-            return self.message
-        return self.message.encode('utf-8')
-
-    def __unicode__(self):
         return self.message
 
 
@@ -385,7 +377,7 @@ class OAuthRemoteApp(object):
             if token:
                 if isinstance(token, (tuple, list)):
                     token = {'access_token': token[0]}
-                elif isinstance(token, string_types):
+                elif isinstance(token, str):
                     token = {'access_token': token}
             client = oauthlib.oauth2.WebApplicationClient(
                 self.consumer_key, token=token
@@ -523,10 +515,10 @@ class OAuthRemoteApp(object):
         if self.request_token_url:
             token = self.generate_request_token(callback)[0]
             url = '%s?oauth_token=%s' % (
-                self.expand_url(self.authorize_url), url_quote(token)
+                self.expand_url(self.authorize_url), quote(token)
             )
             if params:
-                url += '&' + url_encode(params)
+                url += '&' + urlencode(params)
         else:
             assert callback is not None, 'Callback is required for OAuth2'
 
