@@ -526,6 +526,11 @@ class OAuth2Provider(object):
                 return jsonify(status='error')
         """
         uri, http_method, body, headers = extract_params()
+        try:
+            # compatibility to oauthlib
+            headers["Authorization"] = str(headers["Authorization"])
+        except KeyError:
+            pass
         return self.server.verify_request(
             uri, http_method, body, headers, scopes
         )
