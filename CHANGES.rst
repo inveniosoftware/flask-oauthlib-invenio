@@ -3,7 +3,13 @@ Changelog
 
 Here you can see the full list of changes between each Flask-OAuthlib release.
 
+Version 1.1.1
+-------------
+
+- installation: fix authors metadata
+
 Version 1.1.0
+-------------
 
 - setup: relax cachelib version
 
