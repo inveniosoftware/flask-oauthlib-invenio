@@ -16,6 +16,7 @@ from copy import copy
 from functools import wraps
 from oauthlib.common import to_unicode, add_params_to_uri
 from flask import request, redirect, json, session, current_app
+from werkzeug.datastructures import MultiDict
 from werkzeug.http import parse_options_header
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urljoin
 from werkzeug.utils import cached_property
@@ -129,9 +130,11 @@ def parse_response(resp, content, strict=False, content_type=None):
         return content
 
     charset = options.get('charset', 'utf-8')
-    parsed = urlparse(content)
-    return parse_qsl(
-        parsed.query, encoding=charset, strict_parsing=strict, keep_blank_values=True
+    parsed = urlparse(content.decode("utf-8"))
+    return MultiDict(
+        parse_qsl(
+            parsed.path, encoding=charset, strict_parsing=strict, keep_blank_values=True
+        )
     )
 
 def prepare_request(uri, headers=None, data=None, method=None):
