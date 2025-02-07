@@ -3,6 +3,11 @@ Changelog
 
 Here you can see the full list of changes between each Flask-OAuthlib release.
 
+Version 1.1.2
+-------------
+
+- fix: oauth login missing token
+
 Version 1.1.1
 -------------
 
