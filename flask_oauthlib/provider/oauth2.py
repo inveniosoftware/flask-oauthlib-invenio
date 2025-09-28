@@ -861,7 +861,7 @@ class OAuth2RequestValidator(RequestValidator):
 
         # validate expires
         if tok.expires is not None and \
-                datetime.datetime.utcnow() > tok.expires:
+                datetime.datetime.now(datetime.timezone.utc) > tok.expires:
             msg = 'Bearer token is expired.'
             request.error_message = msg
             log.debug(msg)
@@ -905,7 +905,7 @@ class OAuth2RequestValidator(RequestValidator):
             log.debug('Grant not found.')
             return False
         if hasattr(grant, 'expires') and \
-           datetime.datetime.utcnow() > grant.expires:
+           datetime.datetime.now(datetime.timezone.utc) > grant.expires:
             log.debug('Grant is expired.')
             return False
 

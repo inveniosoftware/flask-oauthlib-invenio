@@ -9,7 +9,7 @@
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from .cache import Cache
 
 
@@ -280,7 +280,7 @@ class TokenBinding(BaseBinding):
             self.session.commit()
 
         expires_in = token.get('expires_in')
-        expires = datetime.utcnow() + timedelta(seconds=expires_in)
+        expires = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
         tok = self.model(**token)
         tok.expires = expires
@@ -308,7 +308,7 @@ class GrantBinding(BaseBinding):
         :param code:
         :param request: OAuthlib request object
         """
-        expires = datetime.utcnow() + timedelta(seconds=100)
+        expires = datetime.now(timezone.utc) + timedelta(seconds=100)
         grant = self.model(
             client_id=request.client.client_id,
             code=code['code'],

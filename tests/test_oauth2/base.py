@@ -2,7 +2,7 @@
 
 import os
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask
 from flask import g, render_template, request, jsonify, make_response
 from flask_sqlalchemy import SQLAlchemy
@@ -117,7 +117,7 @@ class Token(db.Model):
 
     def __init__(self, **kwargs):
         expires_in = kwargs.pop('expires_in')
-        self.expires = datetime.utcnow() + timedelta(seconds=expires_in)
+        self.expires = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         for k, v in kwargs.items():
             setattr(self, k, v)
 
@@ -178,7 +178,7 @@ def default_provider(app):
 
     @oauth.grantsetter
     def set_grant(client_id, code, request, *args, **kwargs):
-        expires = datetime.utcnow() + timedelta(seconds=100)
+        expires = datetime.now(timezone.utc) + timedelta(seconds=100)
         grant = Grant(
             client_id=client_id,
             code=code['code'],

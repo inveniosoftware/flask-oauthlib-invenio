@@ -1,6 +1,6 @@
 # coding: utf-8
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from .._base import to_base64
 from .base import TestCase, default_provider
 from .base import create_server, sqlalchemy_provider, cache_provider
@@ -86,7 +86,7 @@ class TestDefaultProvider(TestCase):
         assert 'Mismatching+redirect+URI' in rv.location
 
     def test_get_token(self):
-        expires = datetime.utcnow() + timedelta(seconds=100)
+        expires = datetime.now(timezone.utc) + timedelta(seconds=100)
         grant = Grant(
             user_id=1,
             client_id=self.oauth_client.client_id,
