@@ -3,6 +3,11 @@ Changelog
 
 Here you can see the full list of changes between each Flask-OAuthlib release.
 
+Version 2.0.0
+-------------
+
+- fix(chore): DeprecationWarning stdlib
+
 Version 1.1.2
 -------------
 
