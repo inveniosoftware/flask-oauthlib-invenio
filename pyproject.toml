@@ -1,4 +1,66 @@
-[build-system]
-requires = ["setuptools", "wheel", "babel>2.8"]
-build-backend = "setuptools.build_meta"
+# SPDX-FileCopyrightText: 2024 CERN.
+# SPDX-FileCopyrightText: 2024 Graz University of Technology.
+# SPDX-FileCopyrightText: 2026 TU Wien.
+# SPDX-License-Identifier: MIT
 
+[project]
+name = "Flask-OAuthlib-Invenio"
+description = "OAuthlib for Flask."
+readme = "README.rst"
+requires-python = ">=3.9"
+license = "BSD-3-Clause"
+authors = [
+  { name = "CERN/TU Graz", email = "info@inveniosoftware.org" },
+]
+keywords = [
+  "OAuth2",
+  "flask",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+]
+dependencies = [
+  "cachelib>=0.9.0",
+  "flask>=3.0",
+  "oauthlib>=3.0.0",
+  "requests-oauthlib>=1.0",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/inveniosoftware/flask-oauthlib-invenio"
+
+[project.optional-dependencies]
+tests = [
+  "mock>=5.1.0",
+  "pytest-black>=0.6.0",
+  "pytest-invenio>=3.0.0,<4.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "flask_oauthlib/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "/flask_oauthlib",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/flask_oauthlib",
+]
+
+[tool.isort]
+profile = "black"
+
+[tool.pydocstyle]
+add_ignore = "D401"
+
+[tool.pytest.ini_options]
+addopts = '--black --isort --pydocstyle --doctest-glob="*.rst" --doctest-modules --cov=flask_oauthlib --cov-report=term-missing'
+testpaths = "tests flask_oauthlib"
+live_server_scope = "module"
