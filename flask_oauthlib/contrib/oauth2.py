@@ -1,22 +1,38 @@
 # coding: utf-8
 """
-    flask_oauthlib.contrib.oauth2
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+flask_oauthlib.contrib.oauth2
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    SQLAlchemy and Grant-Caching for OAuth2 provider.
+SQLAlchemy and Grant-Caching for OAuth2 provider.
 
-    contributed by: Randy Topliffe
+contributed by: Randy Topliffe
 """
 
 import logging
 from datetime import datetime, timedelta, timezone
-from .cache import Cache
+
+from invenio_cache import current_cache
+
+__all__ = ("bind_cache_grant", "bind_sqlalchemy")
 
 
-__all__ = ('bind_cache_grant', 'bind_sqlalchemy')
+log = logging.getLogger("flask_oauthlib")
 
 
-log = logging.getLogger('flask_oauthlib')
+def _request_redirect_uri(request):
+    payload = getattr(request, "payload", None)
+    return (
+        payload.redirect_uri
+        if payload is not None
+        else getattr(request, "redirect_uri", None)
+    )
+
+
+def _request_scopes(request):
+    payload = getattr(request, "payload", None)
+    if payload is not None:
+        return (payload.scope or "").split()
+    return list(getattr(request, "scopes", None) or [])
 
 
 class Grant(object):
@@ -31,84 +47,123 @@ class Grant(object):
     :param user: the authorizatopm user
     """
 
-    def __init__(self, cache=None, client_id=None, code=None,
-                 redirect_uri=None, scopes=None, user=None):
+    def __init__(
+        self,
+        cache=None,
+        client_id=None,
+        code=None,
+        redirect_uri=None,
+        scopes=None,
+        user=None,
+        code_challenge=None,
+        code_challenge_method=None,
+    ):
         self._cache = cache
         self.client_id = client_id
         self.code = code
         self.redirect_uri = redirect_uri
         self.scopes = scopes
         self.user = user
+        self.code_challenge = code_challenge
+        self.code_challenge_method = code_challenge_method
+        self._key = None
 
     def delete(self):
-        """Removes itself from the cache
-
-        Note: This is required by the oauthlib
-        """
-        log.debug(
-            "Deleting grant %s for client %s" % (self.code, self.client_id)
-        )
+        """Removes itself from the cache."""
+        log.debug("Deleting grant %s for client %s" % (self.code, self.client_id))
         self._cache.delete(self.key)
         return None
 
     @property
     def key(self):
         """The string used as the key for the cache"""
-        return '%s%s' % (self.code, self.client_id)
+        return self._key or "%s%s" % (self.code, self.client_id)
+
+    @key.setter
+    def key(self, value):
+        self._key = value
 
     def __getitem__(self, item):
         return getattr(self, item)
 
     def keys(self):
-        return ['client_id', 'code', 'redirect_uri', 'scopes', 'user']
+        return [
+            "client_id",
+            "code",
+            "redirect_uri",
+            "scopes",
+            "user",
+            "code_challenge",
+            "code_challenge_method",
+        ]
+
+    def get_redirect_uri(self):
+        """Return redirect URI for Authlib authorization-code grants."""
+        return self.redirect_uri
+
+    def get_scope(self):
+        """Return scope string for Authlib authorization-code grants."""
+        if isinstance(self.scopes, (list, tuple, set)):
+            return " ".join(self.scopes)
+        return self.scopes or ""
 
 
-def bind_cache_grant(app, provider, current_user, config_prefix='OAUTH2'):
-    """Configures an :class:`OAuth2Provider` instance to use various caching
-    systems to get and set the grant token. This removes the need to
-    register :func:`grantgetter` and :func:`grantsetter` yourself.
+def bind_cache_grant(app, provider, current_user, config_prefix="OAUTH2"):
+    """Bind authorization-code grants to Invenio-Cache.
 
-    :param app: Flask application instance
-    :param provider: :class:`OAuth2Provider` instance
-    :param current_user: function that returns an :class:`User` object
-    :param config_prefix: prefix for config
-
-    A usage example::
-
-        oauth = OAuth2Provider(app)
-        app.config.update({'OAUTH2_CACHE_TYPE': 'redis'})
-
-        bind_cache_grant(app, oauth, current_user)
-
-    You can define which cache system you would like to use by setting the
-    following configuration option::
-
-        OAUTH2_CACHE_TYPE = 'null' // memcache, simple, redis, filesystem
-
-    For more information on the supported cache systems please visit:
-    `Cache <http://werkzeug.pocoo.org/docs/contrib/cache/>`_
+    This keeps the historical ``bind_cache_grant`` API, but the storage
+    backend is now the application's ``invenio_cache.current_cache``
+    (Flask-Caching) instead of the deprecated per-OAuth ``OAUTH2_CACHE_*``
+    Cachelib configuration. ``config_prefix`` is accepted for backward
+    compatibility and intentionally ignored.
     """
-    cache = Cache(app, config_prefix)
+    cache = current_cache
+    key_prefix = app.config.get("OAUTH2_GRANT_CACHE_KEY_PREFIX", "oauth2::grant::")
+    timeout = app.config.get("OAUTH2_GRANT_CACHE_EXPIRES", 100)
+
+    provider._supports_pkce = True
+
+    def _key(client_id, code):
+        return "%s%s::%s" % (key_prefix, client_id, code)
+
+    def _consume(key):
+        """Consume a grant once through the public Invenio-Cache API.
+
+        ``add`` atomically creates a bounded-lifetime consumption marker on
+        distributed backends such as Redis. Keeping the marker until the grant
+        expires makes an interrupted consumer fail closed instead of allowing
+        the authorization code to be replayed.
+        """
+        if not cache.add(f"{key}::consumed", True, timeout=timeout):
+            return None
+        value = cache.get(key)
+        if value is not None:
+            cache.delete(key)
+        return value
 
     @provider.grantsetter
     def create_grant(client_id, code, request, *args, **kwargs):
-        """Sets the grant token with the configured cache system"""
+        """Set the grant token with the configured Invenio cache."""
         grant = Grant(
             cache,
             client_id=client_id,
-            code=code['code'],
-            redirect_uri=request.redirect_uri,
-            scopes=request.scopes,
+            code=code["code"],
+            redirect_uri=_request_redirect_uri(request),
+            scopes=_request_scopes(request),
             user=current_user(),
+            code_challenge=code.get("code_challenge"),
+            code_challenge_method=code.get("code_challenge_method"),
         )
+        grant.key = _key(client_id, grant.code)
         log.debug("Set Grant Token with key %s" % grant.key)
-        cache.set(grant.key, dict(grant))
+        cache.set(grant.key, dict(grant), timeout=timeout)
 
     @provider.grantgetter
     def get(client_id, code):
-        """Gets the grant token with the configured cache system"""
+        """Get the grant token from the configured Invenio cache."""
         grant = Grant(cache, client_id=client_id, code=code)
-        ret = cache.get(grant.key)
+        grant.key = _key(client_id, code)
+        ret = _consume(grant.key)
         if not ret:
             log.debug("Grant Token not found with key %s" % grant.key)
             return None
@@ -118,8 +173,9 @@ def bind_cache_grant(app, provider, current_user, config_prefix='OAUTH2'):
         return grant
 
 
-def bind_sqlalchemy(provider, session, user=None, client=None,
-                    token=None, grant=None, current_user=None):
+def bind_sqlalchemy(
+    provider, session, user=None, client=None, token=None, grant=None, current_user=None
+):
     """Configures the given :class:`OAuth2Provider` instance with the
     required getters and setters for persistence with SQLAlchemy.
 
@@ -181,8 +237,11 @@ def bind_sqlalchemy(provider, session, user=None, client=None,
 
     if grant:
         if not current_user:
-            raise ValueError(('`current_user` is required'
-                              'for Grant Binding'))
+            raise ValueError(("`current_user` is required" "for Grant Binding"))
+        provider._supports_pkce = all(
+            hasattr(grant, field)
+            for field in ("code_challenge", "code_challenge_method")
+        )
         grant_binding = GrantBinding(grant, session, current_user)
         provider.grantgetter(grant_binding.get)
         provider.grantsetter(grant_binding.set)
@@ -202,7 +261,7 @@ class BaseBinding(object):
     @property
     def query(self):
         """Determines which method of getting the query object for use"""
-        if hasattr(self.model, 'query'):
+        if hasattr(self.model, "query"):
             return self.model.query
         else:
             return self.session.query(self.model)
@@ -240,6 +299,7 @@ class TokenBinding(BaseBinding):
     """Object use by SQLAlchemyBinding to register the token
     getter and setter
     """
+
     def __init__(self, model, session, current_user=None):
         self.current_user = current_user
         super(TokenBinding, self).__init__(model, session)
@@ -263,7 +323,7 @@ class TokenBinding(BaseBinding):
         :param token: token object
         :param request: OAuthlib request object
         """
-        if hasattr(request, 'user') and request.user:
+        if hasattr(request, "user") and request.user:
             user = request.user
         elif self.current_user:
             # for implicit token
@@ -271,15 +331,13 @@ class TokenBinding(BaseBinding):
 
         client = request.client
 
-        tokens = self.query.filter_by(
-            client_id=client.client_id,
-            user_id=user.id).all()
+        tokens = self.query.filter_by(client_id=client.client_id, user_id=user.id).all()
         if tokens:
             for tk in tokens:
                 self.session.delete(tk)
             self.session.commit()
 
-        expires_in = token.get('expires_in')
+        expires_in = token.get("expires_in")
         expires = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
         tok = self.model(**token)
@@ -309,14 +367,23 @@ class GrantBinding(BaseBinding):
         :param request: OAuthlib request object
         """
         expires = datetime.now(timezone.utc) + timedelta(seconds=100)
-        grant = self.model(
+        values = dict(
             client_id=request.client.client_id,
-            code=code['code'],
-            redirect_uri=request.redirect_uri,
-            scope=' '.join(request.scopes),
+            code=code["code"],
+            redirect_uri=_request_redirect_uri(request),
+            scope=" ".join(_request_scopes(request)),
             user=self.current_user(),
-            expires=expires
+            expires=expires,
         )
+        if all(
+            hasattr(self.model, field)
+            for field in ("code_challenge", "code_challenge_method")
+        ):
+            values.update(
+                code_challenge=code.get("code_challenge"),
+                code_challenge_method=code.get("code_challenge_method"),
+            )
+        grant = self.model(**values)
         self.session.add(grant)
 
         self.session.commit()

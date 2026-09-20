@@ -1,1047 +1,683 @@
 # coding: utf-8
-"""
-    flask_oauthlib.provider.oauth2
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""Authlib-backed compatibility shell for OAuth 2 providers."""
 
-    Implemnts OAuth2 provider support for Flask.
-
-    :copyright: (c) 2013 - 2014 by Hsiaoming Yang.
-"""
-
-import os
+import hashlib
+import json
 import logging
-import datetime
 from functools import wraps
-from flask import request, url_for
-from flask import redirect, abort
+from urllib.parse import urlencode
+
+from authlib.integrations.flask_oauth2 import AuthorizationServer, ResourceProtector
+from authlib.integrations.flask_oauth2.requests import FlaskOAuth2Request
+from authlib.oauth2 import OAuth2Error
+from authlib.oauth2.rfc6749 import grants
+from authlib.oauth2.rfc6749.errors import (
+    InvalidGrantError,
+    InvalidRequestError,
+    UnauthorizedClientError,
+)
+from authlib.oauth2.rfc6749.hooks import hooked
+from authlib.oauth2.rfc6750 import BearerTokenValidator
+from authlib.oauth2.rfc6750.errors import InsufficientScopeError, InvalidTokenError
+from authlib.oauth2.rfc7009 import RevocationEndpoint
+from authlib.oauth2.rfc7636 import CodeChallenge
+from flask import abort, g, redirect, request, session, url_for
 from werkzeug.utils import cached_property, import_string
-from oauthlib import oauth2
-from oauthlib.oauth2 import RequestValidator, Server
-from oauthlib.common import to_unicode, add_params_to_uri
-from ..utils import extract_params, decode_base64, create_response
 
-__all__ = ('OAuth2Provider', 'OAuth2RequestValidator')
+__all__ = ("OAuth2Provider", "OAuth2RequestValidator")
 
-log = logging.getLogger('flask_oauthlib')
+log = logging.getLogger("flask_oauthlib")
+
+
+class TokenDict(dict):
+    """Token dict with Flask-OAuthlib's ``.scopes`` convenience property."""
+
+    @property
+    def scopes(self):
+        scope = self.get("scope") or ""
+        return scope.split()
 
 
 class OAuth2Provider(object):
-    """Provide secure services using OAuth2.
-
-    The server should provide an authorize handler and a token hander,
-    But before the handlers are implemented, the server should provide
-    some getters for the validation.
-
-    Like many other Flask extensions, there are two usage modes. One is
-    binding the Flask app instance::
-
-        app = Flask(__name__)
-        oauth = OAuth2Provider(app)
-
-    The second possibility is to bind the Flask app later::
-
-        oauth = OAuth2Provider()
-
-        def create_app():
-            app = Flask(__name__)
-            oauth.init_app(app)
-            return app
-
-    Configure :meth:`tokengetter` and :meth:`tokensetter` to get and
-    set tokens. Configure :meth:`grantgetter` and :meth:`grantsetter`
-    to get and set grant tokens. Configure :meth:`clientgetter` to
-    get the client.
-
-    Configure :meth:`usergetter` if you need password credential
-    authorization.
-
-    With everything ready, implement the authorization workflow:
-
-        * :meth:`authorize_handler` for consumer to confirm the grant
-        * :meth:`token_handler` for client to exchange access token
-
-    And now you can protect the resource with scopes::
-
-        @app.route('/api/user')
-        @oauth.require_oauth('email', 'username')
-        def user():
-            return jsonify(request.oauth.user)
-    """
+    """Provide OAuth2 services using Authlib behind Flask-OAuthlib's API."""
 
     def __init__(self, app=None, validator_class=None):
         self._before_request_funcs = []
         self._after_request_funcs = []
         self._exception_handler = None
         self._invalid_response = None
+        self._tokenrevoker = None
         self._validator_class = validator_class
+        self._server = None
+        self._require_oauth = None
+        self._supports_pkce = False
         if app:
             self.init_app(app)
 
     def init_app(self, app):
-        """
-        This callback can be used to initialize an application for the
-        oauth provider instance.
-        """
+        """Initialize the provider with a Flask application."""
         self.app = app
-        app.extensions = getattr(app, 'extensions', {})
-        app.extensions['oauthlib.provider.oauth2'] = self
+        app.extensions = getattr(app, "extensions", {})
+        app.extensions["oauthlib.provider.oauth2"] = self
 
     def _on_exception(self, error, redirect_content=None):
-
         if self._exception_handler:
             return self._exception_handler(error, redirect_content)
-        else:
-            return redirect(redirect_content)
+        return redirect(redirect_content or self.error_uri)
 
     @cached_property
     def error_uri(self):
-        """The error page URI.
-
-        When something turns error, it will redirect to this error page.
-        You can configure the error page URI with Flask config::
-
-            OAUTH2_PROVIDER_ERROR_URI = '/error'
-
-        You can also define the error page by a named endpoint::
-
-            OAUTH2_PROVIDER_ERROR_ENDPOINT = 'oauth.error'
-        """
-        error_uri = self.app.config.get('OAUTH2_PROVIDER_ERROR_URI')
+        """The error page URI."""
+        error_uri = self.app.config.get("OAUTH2_PROVIDER_ERROR_URI")
         if error_uri:
             return error_uri
-        error_endpoint = self.app.config.get('OAUTH2_PROVIDER_ERROR_ENDPOINT')
+        error_endpoint = self.app.config.get("OAUTH2_PROVIDER_ERROR_ENDPOINT")
         if error_endpoint:
             return url_for(error_endpoint)
-        return '/oauth/errors'
+        return "/oauth/errors"
 
     @cached_property
     def server(self):
-        """
-        All in one endpoints. This property is created automaticly
-        if you have implemented all the getters and setters.
+        """Authlib authorization server."""
+        if self._server is None:
+            self.app.config.setdefault("OAUTH2_REFRESH_TOKEN_GENERATOR", True)
+            self._server = _CompatAuthorizationServer(
+                self.app, self._clientgetter, self._save_token, provider=self
+            )
+            self._configure_token_generators()
+            self._register_grants()
+            self._register_revocation_endpoint()
+        return self._server
 
-        However, if you are not satisfied with the getter and setter,
-        you can create a validator with :class:`OAuth2RequestValidator`::
+    @cached_property
+    def resource_protector(self):
+        """Authlib resource protector."""
+        protector = ResourceProtector()
+        protector.register_token_validator(_BearerTokenValidator(self))
+        return protector
 
-            class MyValidator(OAuth2RequestValidator):
-                def validate_client_id(self, client_id):
-                    # do something
-                    return True
+    def _configure_token_generators(self):
+        """Map old Flask-OAuthlib config names to Authlib token config."""
+        config = self.app.config
+        expires = config.get("OAUTH2_PROVIDER_TOKEN_EXPIRES_IN")
+        if expires is not None:
+            config.setdefault("OAUTH2_TOKEN_EXPIRES_IN", {"default": expires})
 
-        And assign the validator for the provider::
+        default_generator = None
+        token_generator = config.get("OAUTH2_PROVIDER_TOKEN_GENERATOR")
+        if token_generator:
+            if not callable(token_generator):
+                token_generator = import_string(token_generator)
+            default_generator = _legacy_generator(token_generator)
 
-            oauth._validator = MyValidator()
-        """
-        expires_in = self.app.config.get('OAUTH2_PROVIDER_TOKEN_EXPIRES_IN')
-        token_generator = self.app.config.get(
-            'OAUTH2_PROVIDER_TOKEN_GENERATOR', None
+        refresh_generator = config.get("OAUTH2_PROVIDER_REFRESH_TOKEN_GENERATOR")
+        if refresh_generator:
+            if not callable(refresh_generator):
+                refresh_generator = import_string(refresh_generator)
+            base_generator = (
+                default_generator or self.server.create_bearer_token_generator(config)
+            )
+
+            def generate_token(**kwargs):
+                token = base_generator(**kwargs)
+                if kwargs.get("include_refresh_token"):
+                    try:
+                        token["refresh_token"] = refresh_generator(
+                            kwargs.get("request")
+                        )
+                    except TypeError:
+                        token["refresh_token"] = refresh_generator()
+                return token
+
+            default_generator = generate_token
+
+        if default_generator:
+            self.server.register_token_generator("default", default_generator)
+
+    def _register_grants(self):
+        provider = self
+
+        token_methods = ["POST"]
+        if self.app.config.get("OAUTH2_ALLOW_LEGACY_TOKEN_ENDPOINT_GET", True):
+            token_methods.append("GET")
+
+        class AuthorizationCodeGrant(grants.AuthorizationCodeGrant):
+            TOKEN_ENDPOINT_HTTP_METHODS = token_methods
+            TOKEN_ENDPOINT_AUTH_METHODS = [
+                "client_secret_basic",
+                "client_secret_post",
+                "none",
+            ]
+
+            @hooked
+            def validate_token_request(self):
+                code = self.request.form.get("code")
+                if code is None:
+                    raise InvalidRequestError("Missing 'code' in request.")
+                client = self.authenticate_token_endpoint_client()
+                if not client.check_grant_type(self.GRANT_TYPE):
+                    raise UnauthorizedClientError(
+                        f"The client is not authorized to use 'grant_type={self.GRANT_TYPE}'"
+                    )
+                authorization_code = self.query_authorization_code(code, client)
+                if not authorization_code:
+                    error = InvalidGrantError("Invalid 'code' in request.")
+                    error.status_code = 401
+                    raise error
+                redirect_uri = self.request.payload.redirect_uri
+                original_redirect_uri = authorization_code.get_redirect_uri()
+                if original_redirect_uri and redirect_uri != original_redirect_uri:
+                    raise InvalidGrantError("Invalid 'redirect_uri' in request.")
+                self.request.client = client
+                self.request.authorization_code = authorization_code
+
+            def save_authorization_code(self, code, req):
+                _adapt_authlib_request(req)
+                provider._grantsetter(
+                    req.client.client_id,
+                    {
+                        "code": code,
+                        "code_challenge": req.payload.data.get("code_challenge"),
+                        "code_challenge_method": req.payload.data.get(
+                            "code_challenge_method"
+                        ),
+                    },
+                    req,
+                )
+
+            def query_authorization_code(self, code, client):
+                return provider._grantgetter(client_id=client.client_id, code=code)
+
+            def delete_authorization_code(self, authorization_code):
+                authorization_code.delete()
+
+            def authenticate_user(self, authorization_code):
+                return authorization_code.user
+
+        class ImplicitGrant(grants.ImplicitGrant):
+            def authenticate_token_endpoint_client(self):
+                # The implicit flow runs at the authorization endpoint. Client
+                # secrets must not be submitted through the user agent; the
+                # already validated client_id and redirect URI identify it.
+                client = provider._clientgetter(self.request.payload.client_id)
+                self.request.client = client
+                self.request.auth_method = "none"
+                return client
+
+        class PasswordGrant(grants.ResourceOwnerPasswordCredentialsGrant):
+            TOKEN_ENDPOINT_HTTP_METHODS = token_methods
+            TOKEN_ENDPOINT_AUTH_METHODS = [
+                "client_secret_basic",
+                "client_secret_post",
+                "none",
+            ]
+
+            def authenticate_user(self, username, password):
+                if not hasattr(provider, "_usergetter"):
+                    return None
+                return provider._usergetter(
+                    username, password, self.request.client, self.request
+                )
+
+        class ClientCredentialsGrant(grants.ClientCredentialsGrant):
+            TOKEN_ENDPOINT_HTTP_METHODS = token_methods
+            TOKEN_ENDPOINT_AUTH_METHODS = ["client_secret_basic", "client_secret_post"]
+
+            def create_token_response(self):
+                client = self.request.client
+                if hasattr(client, "user"):
+                    self.request.user = client.user
+                return super().create_token_response()
+
+        class RefreshTokenGrant(grants.RefreshTokenGrant):
+            TOKEN_ENDPOINT_HTTP_METHODS = token_methods
+            TOKEN_ENDPOINT_AUTH_METHODS = [
+                "client_secret_basic",
+                "client_secret_post",
+                "none",
+            ]
+            INCLUDE_NEW_REFRESH_TOKEN = True
+
+            def authenticate_refresh_token(self, refresh_token):
+                return provider._tokengetter(refresh_token=refresh_token)
+
+            def authenticate_user(self, refresh_token):
+                return refresh_token.user
+
+            def revoke_old_credential(self, refresh_token):
+                # Preserve Flask-OAuthlib behaviour: the old DB token is replaced
+                # by the tokensetter when a new token is saved.
+                return None
+
+        self.server.register_grant(
+            AuthorizationCodeGrant,
+            [_OptionalCodeChallenge(self, required=False)],
         )
-        if token_generator and not callable(token_generator):
-            token_generator = import_string(token_generator)
+        self.server.register_grant(ImplicitGrant)
+        self.server.register_grant(PasswordGrant)
+        self.server.register_grant(ClientCredentialsGrant)
+        self.server.register_grant(RefreshTokenGrant)
 
-        refresh_token_generator = self.app.config.get(
-            'OAUTH2_PROVIDER_REFRESH_TOKEN_GENERATOR', None
-        )
-        if refresh_token_generator and not callable(refresh_token_generator):
-            refresh_token_generator = import_string(refresh_token_generator)
+    def _register_revocation_endpoint(self):
+        provider = self
 
-        if hasattr(self, '_validator'):
-            return Server(
-                self._validator,
-                token_expires_in=expires_in,
-                token_generator=token_generator,
-                refresh_token_generator=refresh_token_generator,
-            )
+        class RevokeTokenEndpoint(RevocationEndpoint):
+            CLIENT_AUTH_METHODS = ["client_secret_basic", "client_secret_post", "none"]
 
-        if hasattr(self, '_clientgetter') and \
-           hasattr(self, '_tokengetter') and \
-           hasattr(self, '_tokensetter') and \
-           hasattr(self, '_grantgetter') and \
-           hasattr(self, '_grantsetter'):
+            def query_token(self, token_string, token_type_hint):
+                if token_type_hint:
+                    return provider._tokengetter(**{token_type_hint: token_string})
+                token = provider._tokengetter(access_token=token_string)
+                if not token:
+                    token = provider._tokengetter(refresh_token=token_string)
+                return token
 
-            usergetter = None
-            if hasattr(self, '_usergetter'):
-                usergetter = self._usergetter
+            def revoke_token(self, token, req):
+                if provider._tokenrevoker is not None:
+                    provider._tokenrevoker(token, req)
+                elif hasattr(token, "delete"):
+                    token.delete()
 
-            validator_class = self._validator_class
-            if validator_class is None:
-                validator_class = OAuth2RequestValidator
-            validator = validator_class(
-                clientgetter=self._clientgetter,
-                tokengetter=self._tokengetter,
-                grantgetter=self._grantgetter,
-                usergetter=usergetter,
-                tokensetter=self._tokensetter,
-                grantsetter=self._grantsetter,
-            )
-            self._validator = validator
-            return Server(
-                validator,
-                token_expires_in=expires_in,
-                token_generator=token_generator,
-                refresh_token_generator=refresh_token_generator,
-            )
-        raise RuntimeError('application not bound to required getters')
+        self.server.register_endpoint(RevokeTokenEndpoint)
+
+    def _save_token(self, token, req):
+        _adapt_authlib_request(req)
+        compat_token = TokenDict(token)
+        result = self._tokensetter(compat_token, req)
+        # Legacy token setters may enrich token endpoint JSON responses (for
+        # example with user information). Non-scalar custom values cannot be
+        # encoded into an implicit-flow URI fragment, so keep that response to
+        # the generated OAuth token fields.
+        if req.payload.response_type != "token":
+            token.update(compat_token)
+        return result
 
     def before_request(self, f):
-        """Register functions to be invoked before accessing the resource.
-
-        The function accepts nothing as parameters, but you can get
-        information from `Flask.request` object. It is usually useful
-        for setting limitation on the client request::
-
-            @oauth.before_request
-            def limit_client_request():
-                client_id = request.values.get('client_id')
-                if not client_id:
-                    return
-                client = Client.get(client_id)
-                if over_limit(client):
-                    return abort(403)
-
-                track_request(client)
-        """
         self._before_request_funcs.append(f)
         return f
 
     def after_request(self, f):
-        """Register functions to be invoked after accessing the resource.
-
-        The function accepts ``valid`` and ``request`` as parameters,
-        and it should return a tuple of them::
-
-            @oauth.after_request
-            def valid_after_request(valid, oauth):
-                if oauth.user in black_list:
-                    return False, oauth
-                return valid, oauth
-        """
         self._after_request_funcs.append(f)
         return f
 
     def exception_handler(self, f):
-        """Register a function as custom exception handler.
-
-        **As the default error handling is leaking error to the client, it is
-        STRONGLY RECOMMENDED to implement your own handler to mask
-        the server side errors in production environment.**
-
-        When an error occur during execution, we can
-        handle the error with with the registered function. The function
-        accepts two parameters:
-            - error: the error raised
-            - redirect_content: the content used in the redirect by default
-
-        usage with the flask error handler ::
-            @oauth.exception_handler
-            def custom_exception_handler(error, *args):
-                raise error
-
-            @app.errorhandler(Exception)
-            def all_exception_handler(*args):
-                # any treatment you need for the error
-                return "Server error", 500
-
-        If no function is registered, it will do a redirect with ``redirect_content`` as content.
-        """
         self._exception_handler = f
         return f
 
     def invalid_response(self, f):
-        """Register a function for responsing with invalid request.
-
-        When an invalid request proceeds to :meth:`require_oauth`, we can
-        handle the request with the registered function. The function
-        accepts one parameter, which is an oauthlib Request object::
-
-            @oauth.invalid_response
-            def invalid_require_oauth(req):
-                return jsonify(message=req.error_message), 401
-
-        If no function is registered, it will return with ``abort(401)``.
-        """
         self._invalid_response = f
         return f
 
     def clientgetter(self, f):
-        """Register a function as the client getter.
-
-        The function accepts one parameter `client_id`, and it returns
-        a client object with at least these information:
-
-            - client_id: A random string
-            - client_secret: A random string
-            - is_confidential: A bool represents if it is confidential
-            - redirect_uris: A list of redirect uris
-            - default_redirect_uri: One of the redirect uris
-            - default_scopes: Default scopes of the client
-
-        The client may contain more information, which is suggested:
-
-            - allowed_grant_types: A list of grant types
-            - allowed_response_types: A list of response types
-            - validate_scopes: A function to validate scopes
-
-        Implement the client getter::
-
-            @oauth.clientgetter
-            def get_client(client_id):
-                client = get_client_model(client_id)
-                # Client is an object
-                return client
-        """
         self._clientgetter = f
         return f
 
     def usergetter(self, f):
-        """Register a function as the user getter.
-
-        This decorator is only required for **password credential**
-        authorization::
-
-            @oauth.usergetter
-            def get_user(username, password, client, request,
-                         *args, **kwargs):
-                # client: current request client
-                if not client.has_password_credential_permission:
-                    return None
-                user = User.get_user_by_username(username)
-                if not user.validate_password(password):
-                    return None
-
-                # parameter `request` is an OAuthlib Request object.
-                # maybe you will need it somewhere
-                return user
-        """
         self._usergetter = f
         return f
 
     def tokengetter(self, f):
-        """Register a function as the token getter.
-
-        The function accepts an `access_token` or `refresh_token` parameters,
-        and it returns a token object with at least these information:
-
-            - access_token: A string token
-            - refresh_token: A string token
-            - client_id: ID of the client
-            - scopes: A list of scopes
-            - expires: A `datetime.datetime` object
-            - user: The user object
-
-        The implementation of tokengetter should accepts two parameters,
-        one is access_token the other is refresh_token::
-
-            @oauth.tokengetter
-            def bearer_token(access_token=None, refresh_token=None):
-                if access_token:
-                    return get_token(access_token=access_token)
-                if refresh_token:
-                    return get_token(refresh_token=refresh_token)
-                return None
-        """
         self._tokengetter = f
         return f
 
     def tokensetter(self, f):
-        """Register a function to save the bearer token.
-
-        The setter accepts two parameters at least, one is token,
-        the other is request::
-
-            @oauth.tokensetter
-            def set_token(token, request, *args, **kwargs):
-                save_token(token, request.client, request.user)
-
-        The parameter token is a dict, that looks like::
-
-            {
-                u'access_token': u'6JwgO77PApxsFCU8Quz0pnL9s23016',
-                u'token_type': u'Bearer',
-                u'expires_in': 3600,
-                u'scope': u'email address'
-            }
-
-        The request is an object, that contains an user object and a
-        client object.
-        """
         self._tokensetter = f
         return f
 
     def grantgetter(self, f):
-        """Register a function as the grant getter.
-
-        The function accepts `client_id`, `code` and more::
-
-            @oauth.grantgetter
-            def grant(client_id, code):
-                return get_grant(client_id, code)
-
-        It returns a grant object with at least these information:
-
-            - delete: A function to delete itself
-        """
         self._grantgetter = f
         return f
 
     def grantsetter(self, f):
-        """Register a function to save the grant code.
-
-        The function accepts `client_id`, `code`, `request` and more::
-
-            @oauth.grantsetter
-            def set_grant(client_id, code, request, *args, **kwargs):
-                save_grant(client_id, code, request.user, request.scopes)
-        """
         self._grantsetter = f
         return f
 
+    def tokenrevoker(self, f):
+        """Register the application-owned token revocation callback."""
+        self._tokenrevoker = f
+        return f
+
     def authorize_handler(self, f):
-        """Authorization handler decorator.
+        """Validate and bind authorization consent before invoking a view."""
 
-        This decorator will sort the parameters and headers out, and
-        pre validate everything::
-
-            @app.route('/oauth/authorize', methods=['GET', 'POST'])
-            @oauth.authorize_handler
-            def authorize(*args, **kwargs):
-                if request.method == 'GET':
-                    # render a page for user to confirm the authorization
-                    return render_template('oauthorize.html')
-
-                confirm = request.form.get('confirm', 'no')
-                return confirm == 'yes'
-        """
         @wraps(f)
         def decorated(*args, **kwargs):
-            # raise if server not implemented
-            server = self.server
-            uri, http_method, body, headers = extract_params()
-
-            if request.method in ('GET', 'HEAD'):
-                redirect_uri = request.args.get('redirect_uri', self.error_uri)
-                log.debug('Found redirect_uri %s.', redirect_uri)
-                try:
-                    ret = server.validate_authorization_request(
-                        uri, http_method, body, headers
-                    )
-                    scopes, credentials = ret
-                    kwargs['scopes'] = scopes
-                    kwargs.update(credentials)
-                except oauth2.FatalClientError as e:
-                    log.debug('Fatal client error %r', e, exc_info=True)
-                    return self._on_exception(e, e.in_uri(self.error_uri))
-                except oauth2.OAuth2Error as e:
-                    log.debug('OAuth2Error: %r', e, exc_info=True)
-                    # on auth error, we should preserve state if it's present according to RFC 6749
-                    state = request.values.get('state')
-                    if state and not e.state:
-                        e.state = state  # set e.state so e.in_uri() can add the state query parameter to redirect uri
-                    return self._on_exception(e, e.in_uri(redirect_uri))
-
-                except Exception as e:
-                    log.exception(e)
-                    return self._on_exception(e, add_params_to_uri(
-                        self.error_uri, {'error': str(e)}
-                    ))
-
-            else:
-                redirect_uri = request.values.get(
-                    'redirect_uri', self.error_uri
+            if not request.values.get("client_id"):
+                location = (
+                    self.error_uri
+                    + "?error=invalid_request&error_description=Missing+client_id+parameter."
                 )
+                return self._on_exception(
+                    InvalidRequestError("Missing client_id parameter."), location
+                )
+            client = self._clientgetter(request.values.get("client_id"))
+            if not client:
+                location = (
+                    self.error_uri
+                    + "?error=invalid_request&error_description=Invalid+client_id+parameter."
+                )
+                return self._on_exception(
+                    InvalidRequestError("Invalid client_id parameter."), location
+                )
+            duplicated = next(
+                (key for key in request.values if len(request.values.getlist(key)) > 1),
+                None,
+            )
+            if duplicated:
+                return self._handle_authorization_error(
+                    InvalidRequestError("Multiple %s parameters." % duplicated)
+                )
+            if not request.values.get("response_type"):
+                return self._handle_authorization_error(
+                    InvalidRequestError(
+                        "Missing response_type parameter.",
+                        redirect_uri=_validated_redirect_uri(client),
+                    )
+                )
+            try:
+                grant = self.server.get_consent_grant(end_user=_current_user())
+                req = grant.request
+            except OAuth2Error as error:
+                return self._handle_authorization_error(error)
+            except Exception as error:  # pragma: no cover - defensive compat
+                log.exception(error)
+                return self._on_exception(error, self.error_uri)
 
+            fingerprint = _authorization_request_fingerprint(req)
+            if request.method == "GET":
+                pending = session.setdefault("oauth2_pending_consents", [])
+                if fingerprint not in pending:
+                    pending.append(fingerprint)
+                    del pending[:-10]
+                    session.modified = True
+            elif request.method == "POST":
+                pending = session.get("oauth2_pending_consents", [])
+                if fingerprint not in pending:
+                    return self._handle_authorization_error(
+                        InvalidRequestError(
+                            "Authorization consent was not initiated or has expired."
+                        )
+                    )
+                pending.remove(fingerprint)
+                session["oauth2_pending_consents"] = pending
+
+            kwargs["scopes"] = (req.scope or "").split()
+            kwargs["request"] = req
+            kwargs["client_id"] = req.client.client_id
+            kwargs["redirect_uri"] = req.payload.redirect_uri
+            kwargs["response_type"] = req.payload.response_type
+            kwargs["state"] = req.payload.state
             try:
                 rv = f(*args, **kwargs)
-            except oauth2.FatalClientError as e:
-                log.debug('Fatal client error %r', e, exc_info=True)
-                return self._on_exception(e, e.in_uri(self.error_uri))
-            except oauth2.OAuth2Error as e:
-                log.debug('OAuth2Error: %r', e, exc_info=True)
-                # on auth error, we should preserve state if it's present according to RFC 6749
-                state = request.values.get('state')
-                if state and not e.state:
-                    e.state = state  # set e.state so e.in_uri() can add the state query parameter to redirect uri
-                return self._on_exception(e, e.in_uri(redirect_uri))
-
+            except OAuth2Error as error:
+                return self._handle_authorization_error(error)
             if not isinstance(rv, bool):
-                # if is a response or redirect
                 return rv
+            return self.confirm_authorization_request(grant, req, granted=rv)
 
-            if not rv:
-                # denied by user
-                e = oauth2.AccessDeniedError(state=request.values.get('state'))
-                return self._on_exception(e, e.in_uri(redirect_uri))
-
-            return self.confirm_authorization_request()
         return decorated
 
-    def confirm_authorization_request(self):
-        """When consumer confirm the authorization."""
-        server = self.server
-        scope = request.values.get('scope') or ''
-        scopes = scope.split()
-        credentials = dict(
-            client_id=request.values.get('client_id'),
-            redirect_uri=request.values.get('redirect_uri', None),
-            response_type=request.values.get('response_type', None),
-            state=request.values.get('state', None)
-        )
-        log.debug('Fetched credentials from request %r.', credentials)
-        redirect_uri = credentials.get('redirect_uri')
-        log.debug('Found redirect_uri %s.', redirect_uri)
-
-        uri, http_method, body, headers = extract_params()
+    def _handle_authorization_error(self, error):
+        # Authlib sets error.redirect_uri only after validating it against the
+        # client. Never use request.redirect_uri as an error fallback.
+        uri = getattr(error, "redirect_uri", None) or self.error_uri
         try:
-            ret = server.create_authorization_response(
-                uri, http_method, body, headers, scopes, credentials)
-            log.debug('Authorization successful.')
-            return create_response(*ret)
-        except oauth2.FatalClientError as e:
-            log.debug('Fatal client error %r', e, exc_info=True)
-            return self._on_exception(e, e.in_uri(self.error_uri))
-        except oauth2.OAuth2Error as e:
-            log.debug('OAuth2Error: %r', e, exc_info=True)
+            status, body, headers = error(uri)
+            location = dict(headers).get("Location")
+        except Exception:
+            location = None
+        if not location:
+            params = (
+                error.get_body()
+                if hasattr(error, "get_body")
+                else [("error", str(error))]
+            )
+            location = self.error_uri + ("?" + urlencode(params) if params else "")
+        location = location.replace("Redirect+URI+", "Mismatching+redirect+URI+")
+        return self._on_exception(error, location)
 
-            # on auth error, we should preserve state if it's present according to RFC 6749
-            state = request.values.get('state')
-            if state and not e.state:
-                e.state = state  # set e.state so e.in_uri() can add the state query parameter to redirect uri
-            return self._on_exception(e, e.in_uri(redirect_uri or self.error_uri))
-        except Exception as e:
-            log.exception(e)
-            return self._on_exception(e, add_params_to_uri(
-                self.error_uri, {'error': str(e)}
-            ))
+    def confirm_authorization_request(self, grant, oauth_request, granted=True):
+        """Complete a validated authorization consent request."""
+        try:
+            return self.server.create_authorization_response(
+                request=oauth_request,
+                grant_user=_current_user() if granted else None,
+                grant=grant,
+            )
+        except OAuth2Error as error:
+            return self._handle_authorization_error(error)
+
+    def _acquire_token(self, scopes, oauth_request):
+        """Acquire a bearer token, retaining legacy query/form support."""
+        token_string = None
+        if self.app.config.get("OAUTH2_ALLOW_LEGACY_BEARER_TOKEN_TRANSPORT", True):
+            token_string = request.values.get("access_token")
+        if token_string and not request.headers.get("Authorization"):
+            validator = _BearerTokenValidator(self)
+            token = validator.authenticate_token(token_string)
+            validator.validate_token(token, scopes, oauth_request)
+            return token
+        return self.resource_protector.acquire_token(scopes)
 
     def verify_request(self, scopes):
-        """Verify current request, get the oauth data.
-
-        If you can't use the ``require_oauth`` decorator, you can fetch
-        the data in your request body::
-
-            def your_handler():
-                valid, req = oauth.verify_request(['email'])
-                if valid:
-                    return jsonify(user=req.user)
-                return jsonify(status='error')
-        """
-        uri, http_method, body, headers = extract_params()
+        """Verify current request and return ``(valid, request)``."""
+        req = self.server.create_oauth2_request(request)
         try:
-            # compatibility to oauthlib
-            headers["Authorization"] = str(headers["Authorization"])
-        except KeyError:
-            pass
-        return self.server.verify_request(
-            uri, http_method, body, headers, scopes
-        )
+            token = self._acquire_token(scopes, req)
+        except OAuth2Error as error:
+            req.error_message = getattr(error, "description", None) or str(error)
+            return False, req
+        req.access_token = token
+        req.user = token.user
+        req.scopes = scopes
+        req.client = token.client
+        return True, req
 
     def token_handler(self, f):
-        """Access/refresh token handler decorator.
+        """Access/refresh token handler decorator."""
 
-        The decorated function should return an dictionary or None as
-        the extra credentials for creating the token response.
-
-        You can control the access method with standard flask route mechanism.
-        If you only allow the `POST` method::
-
-            @app.route('/oauth/token', methods=['POST'])
-            @oauth.token_handler
-            def access_token():
-                return None
-        """
         @wraps(f)
         def decorated(*args, **kwargs):
-            server = self.server
-            uri, http_method, body, headers = extract_params()
-            credentials = f(*args, **kwargs) or {}
-            log.debug('Fetched extra credentials, %r.', credentials)
-            ret = server.create_token_response(
-                uri, http_method, body, headers, credentials
-            )
-            return create_response(*ret)
+            f(*args, **kwargs)
+            response = self.server.create_token_response()
+            if response.status_code == 400:
+                payload = response.get_json(silent=True) or {}
+                if payload.get("error") == "invalid_client":
+                    response.status_code = 401
+            return response
+
         return decorated
 
     def revoke_handler(self, f):
-        """Access/refresh token revoke decorator.
+        """Token revoke decorator."""
 
-        Any return value by the decorated function will get discarded as
-        defined in [`RFC7009`_].
-
-        You can control the access method with the standard flask routing
-        mechanism, as per [`RFC7009`_] it is recommended to only allow
-        the `POST` method::
-
-            @app.route('/oauth/revoke', methods=['POST'])
-            @oauth.revoke_handler
-            def revoke_token():
-                pass
-
-        .. _`RFC7009`: http://tools.ietf.org/html/rfc7009
-        """
         @wraps(f)
         def decorated(*args, **kwargs):
-            server = self.server
+            f(*args, **kwargs)
+            return self.server.create_endpoint_response("revocation")
 
-            token = request.values.get('token')
-            request.token_type_hint = request.values.get('token_type_hint')
-            if token:
-                request.token = token
-
-            uri, http_method, body, headers = extract_params()
-            ret = server.create_revocation_response(
-                uri, headers=headers, body=body, http_method=http_method)
-            return create_response(*ret)
         return decorated
 
     def require_oauth(self, *scopes):
         """Protect resource with specified scopes."""
+
         def wrapper(f):
             @wraps(f)
             def decorated(*args, **kwargs):
                 for func in self._before_request_funcs:
                     func()
-
-                if hasattr(request, 'oauth') and request.oauth:
+                if hasattr(request, "oauth") and request.oauth:
                     return f(*args, **kwargs)
-
                 valid, req = self.verify_request(scopes)
-
                 for func in self._after_request_funcs:
                     valid, req = func(valid, req)
-
                 if not valid:
                     if self._invalid_response:
                         return self._invalid_response(req)
                     return abort(401)
                 request.oauth = req
                 return f(*args, **kwargs)
+
             return decorated
+
         return wrapper
 
 
-class OAuth2RequestValidator(RequestValidator):
-    """Subclass of Request Validator.
-
-    :param clientgetter: a function to get client object
-    :param tokengetter: a function to get bearer token
-    :param tokensetter: a function to save bearer token
-    :param grantgetter: a function to get grant token
-    :param grantsetter: a function to save grant token
-    """
-    def __init__(self, clientgetter, tokengetter, grantgetter,
-                 usergetter=None, tokensetter=None, grantsetter=None):
-        self._clientgetter = clientgetter
-        self._tokengetter = tokengetter
-        self._usergetter = usergetter
-        self._tokensetter = tokensetter
-        self._grantgetter = grantgetter
-        self._grantsetter = grantsetter
-
-    def _get_client_creds_from_request(self, request):
-        """Return client credentials based on the current request.
-
-        According to the rfc6749, client MAY use the HTTP Basic authentication
-        scheme as defined in [RFC2617] to authenticate with the authorization
-        server. The client identifier is encoded using the
-        "application/x-www-form-urlencoded" encoding algorithm per Appendix B,
-        and the encoded value is used as the username; the client password is
-        encoded using the same algorithm and used as the password. The
-        authorization server MUST support the HTTP Basic authentication scheme
-        for authenticating clients that were issued a client password.
-        See `Section 2.3.1`_.
-
-        .. _`Section 2.3.1`: https://tools.ietf.org/html/rfc6749#section-2.3.1
-        """
-        if request.client_id is not None:
-            return request.client_id, request.client_secret
-
-        auth = request.headers.get('Authorization')
-        # If Werkzeug successfully parsed the Authorization header,
-        # `extract_params` helper will replace the header with a parsed dict,
-        # otherwise, there is nothing useful in the header and we just skip it.
-        if isinstance(auth, dict):
-            return auth['username'], auth['password']
-
-        return None, None
-
-    def client_authentication_required(self, request, *args, **kwargs):
-        """Determine if client authentication is required for current request.
-
-        According to the rfc6749, client authentication is required in the
-        following cases:
-
-        Resource Owner Password Credentials Grant: see `Section 4.3.2`_.
-        Authorization Code Grant: see `Section 4.1.3`_.
-        Refresh Token Grant: see `Section 6`_.
-
-        .. _`Section 4.3.2`: http://tools.ietf.org/html/rfc6749#section-4.3.2
-        .. _`Section 4.1.3`: http://tools.ietf.org/html/rfc6749#section-4.1.3
-        .. _`Section 6`: http://tools.ietf.org/html/rfc6749#section-6
-        """
-        def is_confidential(client):
-            if hasattr(client, 'is_confidential'):
-                return client.is_confidential
-            client_type = getattr(client, 'client_type', None)
-            if client_type:
-                return client_type == 'confidential'
-            return True
-
-        grant_types = ('password', 'authorization_code', 'refresh_token')
-        client_id, _ = self._get_client_creds_from_request(request)
-        if client_id and request.grant_type in grant_types:
-            client = self._clientgetter(client_id)
-            if client:
-                return is_confidential(client)
-        return False
-
-    def authenticate_client(self, request, *args, **kwargs):
-        """Authenticate itself in other means.
-
-        Other means means is described in `Section 3.2.1`_.
-
-        .. _`Section 3.2.1`: http://tools.ietf.org/html/rfc6749#section-3.2.1
-        """
-        client_id, client_secret = self._get_client_creds_from_request(request)
-        log.debug('Authenticate client %r', client_id)
-
-        client = self._clientgetter(client_id)
-        if not client:
-            log.debug('Authenticate client failed, client not found.')
-            return False
-
-        request.client = client
-
-        # http://tools.ietf.org/html/rfc6749#section-2
-        # The client MAY omit the parameter if the client secret is an empty string.
-        if hasattr(client, 'client_secret') and client.client_secret != client_secret:
-            log.debug('Authenticate client failed, secret not match.')
-            return False
-
-        log.debug('Authenticate client success.')
-        return True
-
-    def authenticate_client_id(self, client_id, request, *args, **kwargs):
-        """Authenticate a non-confidential client.
-
-        :param client_id: Client ID of the non-confidential client
-        :param request: The Request object passed by oauthlib
-        """
-        if client_id is None:
-            client_id, _ = self._get_client_creds_from_request(request)
-
-        log.debug('Authenticate client %r.', client_id)
-        client = request.client or self._clientgetter(client_id)
-        if not client:
-            log.debug('Authenticate failed, client not found.')
-            return False
-
-        # attach client on request for convenience
-        request.client = client
-        return True
-
-    def confirm_redirect_uri(self, client_id, code, redirect_uri, client,
-                             *args, **kwargs):
-        """Ensure client is authorized to redirect to the redirect_uri.
-
-        This method is used in the authorization code grant flow. It will
-        compare redirect_uri and the one in grant token strictly, you can
-        add a `validate_redirect_uri` function on grant for a customized
-        validation.
-        """
-        client = client or self._clientgetter(client_id)
-        log.debug('Confirm redirect uri for client %r and code %r.',
-                  client.client_id, code)
-        grant = self._grantgetter(client_id=client.client_id, code=code)
-        if not grant:
-            log.debug('Grant not found.')
-            return False
-        if hasattr(grant, 'validate_redirect_uri'):
-            return grant.validate_redirect_uri(redirect_uri)
-        log.debug('Compare redirect uri for grant %r and %r.',
-                  grant.redirect_uri, redirect_uri)
-
-        testing = 'OAUTHLIB_INSECURE_TRANSPORT' in os.environ
-        if testing and redirect_uri is None:
-            # For testing
-            return True
-
-        return grant.redirect_uri == redirect_uri
-
-    def get_original_scopes(self, refresh_token, request, *args, **kwargs):
-        """Get the list of scopes associated with the refresh token.
-
-        This method is used in the refresh token grant flow.  We return
-        the scope of the token to be refreshed so it can be applied to the
-        new access token.
-        """
-        log.debug('Obtaining scope of refreshed token.')
-        tok = self._tokengetter(refresh_token=refresh_token)
-        return tok.scopes
-
-    def confirm_scopes(self, refresh_token, scopes, request, *args, **kwargs):
-        """Ensures the requested scope matches the scope originally granted
-        by the resource owner. If the scope is omitted it is treated as equal
-        to the scope originally granted by the resource owner.
-
-        DEPRECATION NOTE: This method will cease to be used in oauthlib>0.4.2,
-        future versions of ``oauthlib`` use the validator method
-        ``get_original_scopes`` to determine the scope of the refreshed token.
-        """
-        if not scopes:
-            log.debug('Scope omitted for refresh token %r', refresh_token)
-            return True
-        log.debug('Confirm scopes %r for refresh token %r',
-                  scopes, refresh_token)
-        tok = self._tokengetter(refresh_token=refresh_token)
-        return set(tok.scopes) == set(scopes)
-
-    def get_default_redirect_uri(self, client_id, request, *args, **kwargs):
-        """Default redirect_uri for the given client."""
-        request.client = request.client or self._clientgetter(client_id)
-        redirect_uri = request.client.default_redirect_uri
-        log.debug('Found default redirect uri %r', redirect_uri)
-        return redirect_uri
-
-    def get_default_scopes(self, client_id, request, *args, **kwargs):
-        """Default scopes for the given client."""
-        request.client = request.client or self._clientgetter(client_id)
-        scopes = request.client.default_scopes
-        log.debug('Found default scopes %r', scopes)
-        return scopes
-
-    def invalidate_authorization_code(self, client_id, code, request,
-                                      *args, **kwargs):
-        """Invalidate an authorization code after use.
-
-        We keep the temporary code in a grant, which has a `delete`
-        function to destroy itself.
-        """
-        log.debug('Destroy grant token for client %r, %r', client_id, code)
-        grant = self._grantgetter(client_id=client_id, code=code)
-        if grant:
-            grant.delete()
-
-    def save_authorization_code(self, client_id, code, request,
-                                *args, **kwargs):
-        """Persist the authorization code."""
-        log.debug(
-            'Persist authorization code %r for client %r',
-            code, client_id
-        )
-        request.client = request.client or self._clientgetter(client_id)
-        self._grantsetter(client_id, code, request, *args, **kwargs)
-        return request.client.default_redirect_uri
-
-    def save_bearer_token(self, token, request, *args, **kwargs):
-        """Persist the Bearer token."""
-        log.debug('Save bearer token %r', token)
-        self._tokensetter(token, request, *args, **kwargs)
-        return request.client.default_redirect_uri
-
-    def validate_bearer_token(self, token, scopes, request):
-        """Validate access token.
-
-        :param token: A string of random characters
-        :param scopes: A list of scopes
-        :param request: The Request object passed by oauthlib
-
-        The validation validates:
-
-            1) if the token is available
-            2) if the token has expired
-            3) if the scopes are available
-        """
-        log.debug('Validate bearer token %r', token)
-        tok = self._tokengetter(access_token=token)
-        if not tok:
-            msg = 'Bearer token not found.'
-            request.error_message = msg
-            log.debug(msg)
-            return False
-
-        # validate expires
-        if tok.expires is not None and \
-                datetime.datetime.now(datetime.timezone.utc) > tok.expires:
-            msg = 'Bearer token is expired.'
-            request.error_message = msg
-            log.debug(msg)
-            return False
-
-        # validate scopes
-        if scopes and not set(tok.scopes) & set(scopes):
-            msg = 'Bearer token scope not valid.'
-            request.error_message = msg
-            log.debug(msg)
-            return False
-
-        request.access_token = tok
-        request.user = tok.user
-        request.scopes = scopes
-
-        if hasattr(tok, 'client'):
-            request.client = tok.client
-        elif hasattr(tok, 'client_id'):
-            request.client = self._clientgetter(tok.client_id)
-        return True
-
-    def validate_client_id(self, client_id, request, *args, **kwargs):
-        """Ensure client_id belong to a valid and active client."""
-        log.debug('Validate client %r', client_id)
-        client = request.client or self._clientgetter(client_id)
-        if client:
-            # attach client to request object
-            request.client = client
-            return True
-        return False
-
-    def validate_code(self, client_id, code, client, request, *args, **kwargs):
-        """Ensure the grant code is valid."""
-        client = client or self._clientgetter(client_id)
-        log.debug(
-            'Validate code for client %r and code %r', client.client_id, code
-        )
-        grant = self._grantgetter(client_id=client.client_id, code=code)
-        if not grant:
-            log.debug('Grant not found.')
-            return False
-        if hasattr(grant, 'expires') and \
-           datetime.datetime.now(datetime.timezone.utc) > grant.expires:
-            log.debug('Grant is expired.')
-            return False
-
-        request.state = kwargs.get('state')
-        request.user = grant.user
-        request.scopes = grant.scopes
-        return True
-
-    def validate_grant_type(self, client_id, grant_type, client, request,
-                            *args, **kwargs):
-        """Ensure the client is authorized to use the grant type requested.
-
-        It will allow any of the four grant types (`authorization_code`,
-        `password`, `client_credentials`, `refresh_token`) by default.
-        Implemented `allowed_grant_types` for client object to authorize
-        the request.
-
-        It is suggested that `allowed_grant_types` should contain at least
-        `authorization_code` and `refresh_token`.
-        """
-        if self._usergetter is None and grant_type == 'password':
-            log.debug('Password credential authorization is disabled.')
-            return False
-
-        default_grant_types = (
-            'authorization_code', 'password',
-            'client_credentials', 'refresh_token',
-        )
-
-        # Grant type is allowed if it is part of the 'allowed_grant_types'
-        # of the selected client or if it is one of the default grant types
-        if hasattr(client, 'allowed_grant_types'):
-            if grant_type not in client.allowed_grant_types:
-                return False
-        else:
-            if grant_type not in default_grant_types:
-                return False
-
-        if grant_type == 'client_credentials':
-            if not hasattr(client, 'user'):
-                log.debug('Client should have a user property')
-                return False
-            request.user = client.user
-
-        return True
-
-    def validate_redirect_uri(self, client_id, redirect_uri, request,
-                              *args, **kwargs):
-        """Ensure client is authorized to redirect to the redirect_uri.
-
-        This method is used in the authorization code grant flow and also
-        in implicit grant flow. It will detect if redirect_uri in client's
-        redirect_uris strictly, you can add a `validate_redirect_uri`
-        function on grant for a customized validation.
-        """
-        request.client = request.client or self._clientgetter(client_id)
-        client = request.client
-        if hasattr(client, 'validate_redirect_uri'):
-            return client.validate_redirect_uri(redirect_uri)
-        return redirect_uri in client.redirect_uris
-
-    def validate_refresh_token(self, refresh_token, client, request,
-                               *args, **kwargs):
-        """Ensure the token is valid and belongs to the client
-
-        This method is used by the authorization code grant indirectly by
-        issuing refresh tokens, resource owner password credentials grant
-        (also indirectly) and the refresh token grant.
-        """
-
-        token = self._tokengetter(refresh_token=refresh_token)
-
-        if token and token.client_id == client.client_id:
-            # Make sure the request object contains user and client_id
-            request.client_id = token.client_id
-            request.user = token.user
-            return True
-        return False
-
-    def validate_response_type(self, client_id, response_type, client, request,
-                               *args, **kwargs):
-        """Ensure client is authorized to use the response type requested.
-
-        It will allow any of the two (`code`, `token`) response types by
-        default. Implemented `allowed_response_types` for client object
-        to authorize the request.
-        """
-        if response_type not in ('code', 'token'):
-            return False
-
-        if hasattr(client, 'allowed_response_types'):
-            return response_type in client.allowed_response_types
-        return True
-
-    def validate_scopes(self, client_id, scopes, client, request,
-                        *args, **kwargs):
-        """Ensure the client is authorized access to requested scopes."""
-        if hasattr(client, 'validate_scopes'):
-            return client.validate_scopes(scopes)
-        return set(client.default_scopes).issuperset(set(scopes))
-
-    def validate_user(self, username, password, client, request,
-                      *args, **kwargs):
-        """Ensure the username and password is valid.
-
-        Attach user object on request for later using.
-        """
-        log.debug('Validating username %r and its password', username)
-        if self._usergetter is not None:
-            user = self._usergetter(
-                username, password, client, request, *args, **kwargs
+class OAuth2RequestValidator(object):
+    """Compatibility placeholder for old custom validator imports."""
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class _BearerTokenValidator(BearerTokenValidator):
+    def __init__(self, provider):
+        super().__init__()
+        self.provider = provider
+
+    def authenticate_token(self, token_string):
+        return self.provider._tokengetter(access_token=token_string)
+
+    def validate_token(self, token, scopes, request):
+        if not token:
+            raise InvalidTokenError(description="token not found")
+        if token.is_expired():
+            raise InvalidTokenError(description="token is expired")
+        if token.is_revoked():
+            raise InvalidTokenError(description="token is revoked")
+        if self.scope_insufficient(token.get_scope(), scopes):
+            raise InsufficientScopeError()
+
+
+class _OptionalCodeChallenge(CodeChallenge):
+    """PKCE extension compatible with legacy authorization-code objects."""
+
+    def __init__(self, provider, required=False):
+        super().__init__(required=required)
+        self.provider = provider
+
+    def validate_code_challenge(self, grant, redirect_uri):
+        super().validate_code_challenge(grant, redirect_uri)
+        if (
+            grant.request.payload.data.get("code_challenge")
+            and not self.provider._supports_pkce
+        ):
+            raise InvalidRequestError(
+                "The configured authorization-code repository does not support PKCE."
             )
-            if user:
-                request.user = user
-                return True
-            return False
-        log.debug('Password credential authorization is disabled.')
-        return False
 
-    def revoke_token(self, token, token_type_hint, request, *args, **kwargs):
-        """Revoke an access or refresh token.
+    def get_authorization_code_challenge(self, authorization_code):
+        return getattr(authorization_code, "code_challenge", None)
+
+    def get_authorization_code_challenge_method(self, authorization_code):
+        return getattr(authorization_code, "code_challenge_method", None)
+
+
+def _validated_redirect_uri(client):
+    """Return only a redirect URI validated against the OAuth client."""
+    if len(request.values.getlist("redirect_uri")) > 1:
+        return None
+    requested_uri = request.values.get("redirect_uri")
+    if requested_uri and client.check_redirect_uri(requested_uri):
+        return requested_uri
+    if not requested_uri:
+        return client.get_default_redirect_uri()
+    return None
+
+
+def _authorization_request_fingerprint(oauth_request):
+    """Fingerprint validated protocol parameters, excluding consent form fields."""
+    excluded = {"confirm", "csrf_token"}
+    values = sorted(
+        (key, tuple(items))
+        for key, items in oauth_request.payload.datalist.items()
+        if key not in excluded
+    )
+    encoded = json.dumps(values, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _adapt_authlib_request(req):
+    """Add Flask-OAuthlib request attribute aliases to Authlib requests."""
+    scope = req.scope or req.payload.scope or ""
+    req.scopes = scope.split() if isinstance(scope, str) else scope
+    return req
+
+
+class _CompatFlaskOAuth2Request(FlaskOAuth2Request):
+    @property
+    def form(self):
+        # Flask-OAuthlib accepted token parameters in query strings for legacy
+        # tests/apps. Authlib's grants read ``request.form`` for token data, so
+        # expose ``values`` here for compatibility.
+        return self._request.values
+
+
+class _CompatAuthorizationServer(AuthorizationServer):
+    def __init__(self, *args, provider=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.provider = provider
+
+    def create_oauth2_request(self, request):
+        from flask import request as flask_req
+
+        return _CompatFlaskOAuth2Request(flask_req)
+
+    def verify_request(self, uri, http_method, body, headers, scopes):
+        """Flask-OAuthlib compatible resource verification method.
+
+        Invenio-OAuth2Server historically called ``oauth2.server.verify_request``
+        directly from a ``before_request`` hook. Authlib verifies bearer tokens
+        through ``ResourceProtector`` instead, so this adapter preserves the old
+        server method while delegating validation to the provider's protector.
+        The explicit request arguments are accepted for API compatibility; the
+        Authlib Flask integration validates the active Flask request.
         """
-        if token_type_hint:
-            tok = self._tokengetter(**{token_type_hint: token})
-        else:
-            tok = self._tokengetter(access_token=token)
-            if not tok:
-                tok = self._tokengetter(refresh_token=token)
+        req = self.create_oauth2_request(request)
+        try:
+            token = self.provider._acquire_token(scopes, req)
+        except OAuth2Error as error:
+            req.error_message = getattr(error, "description", None) or str(error)
+            return False, req
+        req.access_token = token
+        req.user = token.user
+        req.scopes = scopes
+        req.client = token.client
+        return True, req
 
-        if tok:
-            request.client_id = tok.client_id
-            request.user = tok.user
-            tok.delete()
-            return True
 
-        msg = 'Invalid token supplied.'
-        log.debug(msg)
-        request.error_message = msg
-        return False
+def _current_user():
+    if hasattr(g, "user") and g.user is not None:
+        return g.user
+    try:
+        from flask_login import current_user
+
+        user = current_user._get_current_object()
+        if getattr(user, "is_authenticated", False):
+            return user
+    except Exception:  # pragma: no cover
+        pass
+    return True
+
+
+def _legacy_generator(func):
+    def _call(req):
+        try:
+            return func(req)
+        except TypeError:
+            return func()
+
+    def generate_token(**kwargs):
+        req = kwargs.get("request")
+        token = TokenDict(
+            access_token=_call(req),
+            token_type="Bearer",
+            expires_in=kwargs.get("expires_in") or 3600,
+            scope=kwargs.get("scope") or "",
+        )
+        if kwargs.get("include_refresh_token"):
+            token["refresh_token"] = _call(req)
+        return token
+
+    return generate_token
